@@ -1,15 +1,16 @@
 import myHttp from "../src/myhttp.js";
 
 const server = myHttp.createServer((req, res) => {
-  console.log(`Received a ${req.method} request for ${req.path}`);
+  let body = "";
 
-  if (req.path === "/") {
-    res.send("Welcome to my DIY HTTP Server!");
-  } else if (req.path === "/about") {
-    res.send("This server is running on raw TCP sockets.");
-  } else {
-    res.send("404 Not Found", 404);
-  }
+  req.on("data", (chunk) => {
+    body += chunk;
+  });
+
+  req.on("end", () => {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ received: body }));
+  });
 });
 
 server.listen(3000, () => {
