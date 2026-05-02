@@ -1,16 +1,35 @@
 import net from "net";
 
+function createRequestStream(meta) {
+  const listeners = {};
+
+  return {
+    ...meta,
+
+    on(event, handler) {
+      listeners[event] = listeners[event] || [];
+      listeners[event].push(handler);
+    },
+
+    emit(event, data) {
+      (listeners[event] || []).forEach((fn) => fn(data));
+    },
+  };
+}
+
 const myHttp = {
   createServer: (requestListener) => {
     return net.createServer((socket) => {
       let buffer = "";
       let headersParsed = false;
       let req = null;
+      let contentLength = 0;
+      let receivedLength = 0;
 
       socket.on("data", (chunk) => {
         buffer += chunk.toString();
 
-        // Step 1: Parse headers only once
+        // 🔹 Step 1: Parse headers
         if (!headersParsed && buffer.includes("\r\n\r\n")) {
           const [headerPart, rest] = buffer.split("\r\n\r\n");
 
@@ -23,66 +42,60 @@ const myHttp = {
             return acc;
           }, {});
 
-          req = {
+          contentLength = parseInt(headers["content-length"] || "0");
+
+          req = createRequestStream({
             method,
-            url: path, // closer to Node.js naming
+            url: path,
             httpVersion: version.replace("HTTP/", ""),
             headers,
-            body: "",
+          });
+
+          buffer = rest;
+          headersParsed = true;
+
+          // 🔹 Create response
+          const res = {
+            write: (chunk) => socket.write(chunk),
+            end: (data = "") => {
+              if (data) socket.write(data);
+              socket.end();
+            },
+            writeHead: (statusCode, headers = {}) => {
+              let response = `HTTP/1.1 ${statusCode} OK\r\n`;
+              for (const key in headers) {
+                response += `${key}: ${headers[key]}\r\n`;
+              }
+              response += "\r\n";
+              socket.write(response);
+            },
           };
 
-          buffer = rest; // remaining data is body
-          headersParsed = true;
+          requestListener(req, res);
         }
 
-        // Step 2: If headers parsed, collect body
+        // 🔹 Step 2: Stream body
         if (headersParsed && req) {
-          const contentLength = parseInt(req.headers["content-length"] || "0");
+          while (buffer.length > 0 && receivedLength < contentLength) {
+            const remaining = contentLength - receivedLength;
+            const chunkToSend = buffer.slice(0, remaining);
 
-          // Wait until full body is received
-          if (buffer.length >= contentLength) {
-            req.body = buffer.slice(0, contentLength);
+            req.emit("data", chunkToSend);
 
-            // Optional: JSON parsing (still low-level enough)
-            if (req.headers["content-type"] === "application/json") {
-              try {
-                req.body = JSON.parse(req.body);
-              } catch {
-                // keep raw if parsing fails
-              }
-            }
+            receivedLength += chunkToSend.length;
+            buffer = buffer.slice(chunkToSend.length);
+          }
 
-            const res = {
-              write: (chunk) => socket.write(chunk),
-              end: (data = "") => {
-                if (data) socket.write(data);
-                socket.end();
-              },
-              setHeader: (key, value) => {
-                res.headers = res.headers || {};
-                res.headers[key] = value;
-              },
-              writeHead: (statusCode, headers = {}) => {
-                const statusMessage = "OK"; // simplified
-                let response = `HTTP/1.1 ${statusCode} ${statusMessage}\r\n`;
+          // 🔹 Step 3: End event
+          if (receivedLength >= contentLength) {
+            req.emit("end");
 
-                const finalHeaders = { ...(res.headers || {}), ...headers };
-
-                for (const key in finalHeaders) {
-                  response += `${key}: ${finalHeaders[key]}\r\n`;
-                }
-
-                response += "\r\n";
-                socket.write(response);
-              },
-            };
-
-            requestListener(req, res);
-
-            // Reset for next request (basic, no keep-alive handling yet)
+            // Reset for next request (basic)
             buffer = "";
             headersParsed = false;
             req = null;
+            contentLength = 0;
+            receivedLength = 0;
           }
         }
       });
