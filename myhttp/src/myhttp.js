@@ -1,56 +1,90 @@
 import net from "net";
 
 const myHttp = {
-  createServer: (requestHandler) => {
-    // 1. Create a raw TCP Server
+  createServer: (requestListener) => {
     return net.createServer((socket) => {
-      socket.on("data", (rawBuffer) => {
-        console.log("Received raw data from client:");
-        console.log(rawBuffer);
-        console.log("----");
-        const rawRequest = rawBuffer.toString();
-        console.log("Raw Request:\n", rawRequest);
-        console.log("----");
+      let buffer = "";
+      let headersParsed = false;
+      let req = null;
 
-        // 2. THE PARSER: Convert raw string to a 'req' object
-        // HTTP format: "METHOD PATH VERSION" followed by headers
-        const lines = rawRequest.split("\r\n");
-        console.log("Parsed Lines:\n", lines);
-        console.log("----");
-        const [method, path, version] = lines[0].split(" ");
-        console.log(
-          `Parsed Request Line: Method=${method}, Path=${path}, Version=${version}`,
-        );
+      socket.on("data", (chunk) => {
+        buffer += chunk.toString();
 
-        const req = {
-          method,
-          path,
-          version,
-          headers: lines.slice(1).reduce((acc, line) => {
+        // Step 1: Parse headers only once
+        if (!headersParsed && buffer.includes("\r\n\r\n")) {
+          const [headerPart, rest] = buffer.split("\r\n\r\n");
+
+          const lines = headerPart.split("\r\n");
+          const [method, path, version] = lines[0].split(" ");
+
+          const headers = lines.slice(1).reduce((acc, line) => {
             const [key, value] = line.split(": ");
             if (key) acc[key.toLowerCase()] = value;
             return acc;
-          }, {}),
-        };
+          }, {});
 
-        // 3. THE RESPONSE ABSTRACTION: Helper to format the output
-        const res = {
-          send: (body, status = 200) => {
-            const response =
-              `HTTP/1.1 ${status} OK\r\n` +
-              `Content-Type: text/plain\r\n` +
-              `Content-Length: ${body.length}\r\n` +
-              `Connection: close\r\n` + // Tell the browser to close the TCP socket
-              `\r\n` +
-              `${body}`;
+          req = {
+            method,
+            url: path, // closer to Node.js naming
+            httpVersion: version.replace("HTTP/", ""),
+            headers,
+            body: "",
+          };
 
-            socket.write(response);
-            socket.end(); // Close the TCP connection
-          },
-        };
+          buffer = rest; // remaining data is body
+          headersParsed = true;
+        }
 
-        // 4. Pass our custom objects to the user's function
-        requestHandler(req, res);
+        // Step 2: If headers parsed, collect body
+        if (headersParsed && req) {
+          const contentLength = parseInt(req.headers["content-length"] || "0");
+
+          // Wait until full body is received
+          if (buffer.length >= contentLength) {
+            req.body = buffer.slice(0, contentLength);
+
+            // Optional: JSON parsing (still low-level enough)
+            if (req.headers["content-type"] === "application/json") {
+              try {
+                req.body = JSON.parse(req.body);
+              } catch {
+                // keep raw if parsing fails
+              }
+            }
+
+            const res = {
+              write: (chunk) => socket.write(chunk),
+              end: (data = "") => {
+                if (data) socket.write(data);
+                socket.end();
+              },
+              setHeader: (key, value) => {
+                res.headers = res.headers || {};
+                res.headers[key] = value;
+              },
+              writeHead: (statusCode, headers = {}) => {
+                const statusMessage = "OK"; // simplified
+                let response = `HTTP/1.1 ${statusCode} ${statusMessage}\r\n`;
+
+                const finalHeaders = { ...(res.headers || {}), ...headers };
+
+                for (const key in finalHeaders) {
+                  response += `${key}: ${finalHeaders[key]}\r\n`;
+                }
+
+                response += "\r\n";
+                socket.write(response);
+              },
+            };
+
+            requestListener(req, res);
+
+            // Reset for next request (basic, no keep-alive handling yet)
+            buffer = "";
+            headersParsed = false;
+            req = null;
+          }
+        }
       });
     });
   },
